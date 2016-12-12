@@ -1,15 +1,12 @@
 package discordircgw
 
 import java.net.{ ServerSocket, Socket, InetAddress }
-import net.dv8tion.jda.core.entities.TextChannel
-import net.dv8tion.jda.core.entities.User
+import net.dv8tion.jda.core.entities.{ ChannelType, Message, MessageChannel, TextChannel, User }
 import net.dv8tion.jda.core.events.ReadyEvent
 import net.dv8tion.jda.core.events.message.{ MessageReceivedEvent, MessageUpdateEvent }
 import net.dv8tion.jda.core.hooks.EventListener
 import net.dv8tion.jda.core.{ AccountType, JDABuilder }
 import scala.collection.JavaConverters._
-
-import IrcParser.IrcEvent
 
 object Main extends App {
 
@@ -55,23 +52,27 @@ object Main extends App {
           Iterator.continually(in.readLine()).takeWhile(_ != null).map { s => println(s); s }.foreach(s => IrcParser(s) match {
             case Left(err) => println("wut irc?: " + err)
             case Right(ircEvt) =>
-              try ircStateMachine.applyIfDefined(ircEvt)
+              try ircStateMachine(ircEvt)
               catch { case e: Exception => e.printStackTrace() }
           })
         }, "irc client").start()
-        messageHandling(client)
+        messageHandling(client, ircStateMachine)
     }
 
-    def messageHandling(client: Socket): Transition = transition {
-      case msg: MessageReceivedEvent => messageHandling(client)
-      case msg: MessageUpdateEvent => messageHandling(client)
+    def messageHandling(client: Socket, clientStateMachine: IrcStateMachine): Transition = transition {
+      case mre: MessageReceivedEvent if (mre.getAuthor) != jda.getSelfUser =>
+        clientStateMachine(SendMessage(mre.getAuthor, mre.getChannel, mre.getMessage))
+        messageHandling(client, clientStateMachine)
+      case mue: MessageUpdateEvent if (mue.getAuthor) != jda.getSelfUser =>
+        clientStateMachine(SendMessage(mue.getAuthor, mue.getChannel, mue.getMessage, true))
+        messageHandling(client, clientStateMachine)
 
     }
   }
-  class IrcStateMachine(clientOut: java.io.OutputStream) extends StateMachine[IrcEvent] {
+  class IrcStateMachine(clientOut: java.io.OutputStream) extends StateMachine[IrcClientEvent] {
     type MappedName = String
     case class MessageHandlingState(myUser: String, myNick: String,
-      mappedUserNames: Map[String, Seq[(User, MappedName)]],
+      mappedUserNames: Map[MappedName, User],
       mappedChannelNames: Map[String, TextChannel],
       joinedChannels: Seq[TextChannel])
 
@@ -81,8 +82,8 @@ object Main extends App {
         sendSmsg(nick.get, 1, "Welcome")
         sendSmsg(nick.get, 376, "there was no MOTD.")
         messageHandling(MessageHandlingState(user.get, nick.get,
-          jda.getUsers.asScala.groupBy(cleanNameForIrc).map(e => e._1 -> mapNames(e._2)),
-          jda.getGuilds.asScala.flatMap(g => g.getTextChannels.asScala.map(c => (g.getName + "_" + c.getName).replace(' ', '_') -> c)).toMap,
+          jda.getUsers.asScala.groupBy(_.getName).flatMap(e => mapNames(e._2)).toMap,
+          jda.getGuilds.asScala.flatMap(g => g.getTextChannels.asScala.map(c => ("#" + g.getName + "_" + c.getName).replace(' ', '_') -> c)).toMap,
           Seq.empty))
       } else transition {
         case IrcEvent(_, "USER", args) => connecting(Some(args.last), nick)
@@ -94,7 +95,7 @@ object Main extends App {
       case evt =>
         evt match {
           case IrcEvent(_, "JOIN", Seq(chans)) =>
-            val joinedChannels = chans.split(",").map(_.stripPrefix("#")) flatMap { chan =>
+            val joinedChannels = chans.split(",") flatMap { chan =>
               val found = state.mappedChannelNames.get(chan)
               found.fold(sendSmsg(state.myNick, 403, chan, "This channel does not exist in your server!")) { _ =>
                 sendMsg(state.myNick, "JOIN", chan)
@@ -112,46 +113,47 @@ object Main extends App {
           case IrcEvent(_, "NAMES", Seq(chan)) =>
             state.mappedChannelNames.get(chan) match {
               case Some(tc) =>
-                val nicks = tc.getMembers.asScala.map(m => state.mappedUserNames.values.flatten.collectFirst {
-                  case (user, mappedName) if user == m.getUser => mappedName
-                }.getOrElse(m.getUser.getName))
+                val nicks = tc.getMembers.asScala.map(m => state.mappedUserNames.collectFirst {
+                  case (mappedName, user) if user == m.getUser => mappedName
+                }.getOrElse(cleanNameForIrc(m.getUser)))
                 nicks.grouped(10) foreach (g => sendSmsg(state.myNick, 353, "=", chan, g.mkString(" ")))
                 sendSmsg(state.myNick, 366, chan, "End of /NAMES list.")
               case None => sendSmsg(state.myNick, 401, chan, "You are not joined to that channel.")
             }
             messageHandling(state)
 
+          case IrcEvent(_, "PRIVMSG", Seq(dest, msg)) if dest.startsWith("#") && !state.joinedChannels.contains(state.mappedChannelNames(dest)) =>
+            sendSmsg(state.myNick, 401, "Destination channel not joined.")
+            messageHandling(state)
+
           case IrcEvent(_, "PRIVMSG", Seq(dest, msg)) =>
             if (dest.startsWith("#")) {
-              state.joinedChannels
+              val chn = state.mappedChannelNames(dest)
+              chn.sendMessage(msg).queue()
             } else {
-              
+              state.mappedUserNames.get(dest) match {
+                case None => sendSmsg(state.myNick, 401, "User not found")
+                case Some(user) => user.getPrivateChannel.sendMessage(msg).queue()
+              }
             }
-            
+
             messageHandling(state)
-            
-          case IrcEvent(_, "USERHOST", args) => 
-            sendSmsg(state.myNick, 302, args.filter(_ == state.myNick).map(u => s"$u=${state.myUser}@127.0.0.1"):_*)
+
+          case IrcEvent(_, "USERHOST", args) =>
+            sendSmsg(state.myNick, 302, args.filter(_ == state.myNick).map(u => s"$u=${state.myUser}@127.0.0.1"): _*)
             messageHandling(state)
 
           case IrcEvent(_, "WHO", Seq(who)) =>
             if (who.startsWith("#")) {
               state.mappedChannelNames.get(who).foreach { channel =>
                 channel.getMembers.asScala.foreach { m =>
-                  val userName = m.getUser.getName
-                  val mappedUserName = state.mappedUserNames.get(userName).flatMap(_.find(_._1.getName == userName).map(e => userName + e._2)).getOrElse(userName)
+                  val mappedUserName = state.mappedUserNames.collectFirst { case (mn, user) if user == m.getUser => mn }.getOrElse(cleanNameForIrc(m.getUser))
                   sendSmsg(state.myNick, 352, who, mappedUserName, "localhost", serverName, mappedUserName, "H", ":0", m.getNickname)
                 }
               }
             } else {
-              //get the name straight, if not found try removing the digits at the end because we might have mapped it
-              state.mappedUserNames.get(who).orElse(state.mappedUserNames.get(who.reverse.dropWhile(_.isDigit).reverse)).foreach { users =>
-                if (users.size == 1)
-                  sendSmsg(state.myNick, 352, who, who, "localhost", serverName, who, "H", ":0", who)
-                else users foreach { user =>
-                  val userNick = user._2
-                  sendSmsg(state.myNick, 352, who, userNick, "localhost", serverName, userNick, "H", ":0", userNick)
-                }
+              state.mappedUserNames.get(who) foreach { user =>
+                sendSmsg(state.myNick, 352, who, who, "localhost", serverName, who, "H", ":0", who)
               }
             }
             sendSmsg(state.myNick, 315, "End of /WHO list.")
@@ -162,31 +164,44 @@ object Main extends App {
             messageHandling(state)
 
           case IrcEvent(_, other, args) =>
-            sendSmsg(state.myNick, 302, "Not enough parameters.")
+            sendSmsg(state.myNick, 461, "Not enough parameters.")
             messageHandling(state)
+
+          case SendMessage(author, channel, msg, update) if state.joinedChannels.contains(channel) || channel.getType == ChannelType.PRIVATE =>
+            val mappedUser = state.mappedUserNames.find(_._2 == author).get._1
+            val from = if (channel.getType == ChannelType.PRIVATE) mappedUser else state.mappedChannelNames.find(_._2 == channel).get._1
+            val content = (if (update) "(edited) " else "") + msg.getContent
+            sendMsg(mappedUser, "PRIVMSG", from, content)
+            messageHandling(state)
+
+          case _ => messageHandling(state)
         }
     }
 
     private def cleanNameForIrc(u: User): String = u.getName.replaceAll("\\s", "_")
-    private def mapNames(s: Seq[User]): Seq[(User, MappedName)] = {
-      if (s.size == 1) s.map(u => u -> cleanNameForIrc(u))
-      else s.zipWithIndex.map(e => e._1 -> (cleanNameForIrc(e._1) + e._2))
+    private def mapNames(s: Seq[User]): Seq[(MappedName, User)] = {
+      if (s.size == 1) s.map(u => cleanNameForIrc(u) -> u)
+      else s.zipWithIndex.map(e => (cleanNameForIrc(e._1) + e._2) -> e._1)
     }
-    private def sendSmsg(nickname: String, cmd: Any, args: String*): Unit = {
+    def sendSmsg(nickname: String, cmd: Any, args: String*): Unit = {
       if (args.dropRight(1).exists(_.contains(' '))) throw new IllegalArgumentException("space in non-last command")
       val ircArgs = (args.dropRight(1) ++ args.lastOption.map(":" + _)).mkString(" ")
       send(s":$serverName $cmd $nickname $ircArgs")
     }
-    private def sendMsg(userfrom: String, cmd: Any, args: String*): Unit = {
+    def sendMsg(userfrom: String, cmd: Any, args: String*): Unit = {
       if (args.dropRight(1).exists(_.contains(' '))) throw new IllegalArgumentException("space in non-last command")
       val ircArgs = (args.dropRight(1) ++ args.lastOption.map(":" + _)).mkString(" ")
       val resUserfrom = if (userfrom.charAt(0) != ':') s":$userfrom!$userfrom@localhost" else userfrom
       send(s"$resUserfrom $cmd $ircArgs")
     }
-    private def send(s: String) = {
+    def send(s: String) = {
       println(s"sending $s")
       clientOut.write((s + "\r\n").getBytes("utf-8"))
     }
   }
 
 }
+
+sealed trait IrcClientEvent
+case class IrcEvent(prefix: Option[String], cmd: String, args: Seq[String]) extends IrcClientEvent
+case class SendMessage(from: User, channel: MessageChannel, message: Message, updated: Boolean = false) extends IrcClientEvent

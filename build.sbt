@@ -14,4 +14,4 @@ resolvers += "jcenter" at "http://jcenter.bintray.com"
 
 enablePlugins(JavaAppPackaging)
 mainClass in Compile := Some("discordircgw.Main")
-javaOptions in Universal ++= Seq("-J-Xmx14m")
+javaOptions in Universal ++= Seq("-J-Xmx40m")

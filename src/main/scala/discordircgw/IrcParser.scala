@@ -11,7 +11,6 @@ object IrcParser {
   val middle = !":" ~ CharsWhile(c => c != ' ' && c != 0 && c != '\n' && c != '\r')
   val trailing = CharsWhile(c => c != 0 && c != '\n' && c != '\r', 0)
 
-  case class IrcEvent(prefix: Option[String], cmd: String, args: Seq[String])
   def apply(s: String) = message.parse(s) match {
     case f: Parsed.Failure => Left(ParseError(f).getMessage)
     case Parsed.Success((prefix, cmd, (args, last)), _) => Right(IrcEvent(prefix, cmd, args ++ last))
