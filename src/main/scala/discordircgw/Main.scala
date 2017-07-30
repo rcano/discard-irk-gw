@@ -20,7 +20,7 @@ object Main extends App {
   }.parse(args, CliArgs()).getOrElse(sys.exit(1))
 
   val jda = new JDABuilder(AccountType.CLIENT).setAudioEnabled(false).setAutoReconnect(true).
-    setToken(cliArgs.token).addListener(DiscordBot).buildAsync()
+    setToken(cliArgs.token).addEventListener(DiscordBot).buildAsync()
 
   val serverName = "DiscordIrcGw"
 
@@ -79,12 +79,15 @@ object Main extends App {
     override def initState = connecting(None, None)
     def connecting(user: Option[String], nick: Option[String]): Transition = {
       if (user.isDefined && nick.isDefined) {
-        sendSmsg(nick.get, 1, "Welcome")
-        sendSmsg(nick.get, 376, "there was no MOTD.")
-        messageHandling(MessageHandlingState(user.get, nick.get,
+        val state = MessageHandlingState(user.get, nick.get,
           jda.getUsers.asScala.groupBy(_.getName).flatMap(e => mapNames(e._2)).toMap,
           jda.getGuilds.asScala.flatMap(g => g.getTextChannels.asScala.map(c => ("#" + g.getName + "_" + c.getName).replace(' ', '_') -> c)).toMap,
-          Seq.empty))
+          Seq.empty)
+
+        val mappedChannelNames = state.mappedChannelNames.keys.toSeq.sorted
+        sendSmsg(nick.get, 1, s"Welcome, here are your channels: ${mappedChannelNames.mkString(", ")}")
+        sendSmsg(nick.get, 376, "there was no MOTD.")
+        messageHandling(state)
       } else transition {
         case IrcEvent(_, "USER", args) => connecting(Some(args.last), nick)
         case IrcEvent(_, "NICK", args) => connecting(user, Some(args.last))
@@ -104,7 +107,9 @@ object Main extends App {
               found
             }
             //delegate to names
-            messageHandling(state.copy(joinedChannels = state.joinedChannels ++ joinedChannels))
+            val newJoinedChannels = state.joinedChannels ++ joinedChannels
+            println("all joined channels: " + newJoinedChannels.map(_.getName).mkString(", "))
+            messageHandling(state.copy(joinedChannels = newJoinedChannels))
 
           case IrcEvent(_, "NAMES", args) if args.isEmpty =>
             sendSmsg(state.myNick, 366, "*", "End of /NAMES list.")
@@ -123,7 +128,7 @@ object Main extends App {
             messageHandling(state)
 
           case IrcEvent(_, "PRIVMSG", Seq(dest, msg)) if dest.startsWith("#") && !state.joinedChannels.contains(state.mappedChannelNames(dest)) =>
-            sendSmsg(state.myNick, 401, "Destination channel not joined.")
+            sendSmsg(state.myNick, 401, "Destination channel not joined. Joined channels: " + state.joinedChannels.map(_.getName).mkString(", "))
             messageHandling(state)
 
           case IrcEvent(_, "PRIVMSG", Seq(dest, msg)) =>
@@ -133,7 +138,12 @@ object Main extends App {
             } else {
               state.mappedUserNames.get(dest) match {
                 case None => sendSmsg(state.myNick, 401, "User not found")
-                case Some(user) => user.getPrivateChannel.sendMessage(msg).queue()
+                case Some(user) =>
+                  try {
+                    user.openPrivateChannel().complete(true).sendMessage(msg).queue()
+                  } catch {
+                    case e: Exception => sendSmsg(state.myNick, 400, s"Could not open private channel with user: $e")
+                  }
               }
             }
 
